@@ -1,0 +1,85 @@
+name: Deploy Qwik Frontend
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/morphy-frontend:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/morphy-frontend:latest
+          build-args: |
+            VITE_API_BASE_URL=${{ secrets.FRONTEND_API_URL }}
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.FRONTEND_VPS_HOST }}
+          username: ${{ secrets.FRONTEND_VPS_USERNAME }}
+          key: ${{ secrets.FRONTEND_VPS_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            cd /opt/frontend
+
+            # Set environment variable
+            export VITE_API_BASE_URL=https://api.formipeek.com
+
+            # Stop and remove old containers
+            docker stop morphy-frontend 2>/dev/null || true
+            docker rm morphy-frontend 2>/dev/null || true
+
+            # Pull latest image from Docker Hub
+            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/morphy-frontend:latest
+
+            # Deploy Qwik SSR container (Node.js on port 3000)
+            docker run -d \
+              --name morphy-frontend \
+              --add-host=host.docker.internal:host-gateway \
+              --label "traefik.enable=true" \
+              --label "traefik.http.routers.morphy.rule=Host(\`formipeek.com\`)" \
+              --label "traefik.http.routers.morphy.tls=true" \
+              --label "traefik.http.routers.morphy.tls.certresolver=letsencrypt" \
+              --label "traefik.http.routers.morphy-www.rule=Host(\`www.formipeek.com\`)" \
+              --label "traefik.http.routers.morphy-www.tls=true" \
+              --label "traefik.http.routers.morphy-www.tls.certresolver=letsencrypt" \
+              --label "traefik.http.services.morphy.loadbalancer.server.port=3000" \
+              --network traefik \
+              --restart unless-stopped \
+              -e VITE_API_BASE_URL=https://api.formipeek.com \
+              -e PORT=3000 \
+              ${{ secrets.DOCKERHUB_USERNAME }}/morphy-frontend:latest
+
+            # Verify deployment
+            sleep 10
+            docker ps | grep morphy-frontend
+            
+            # Test SSR endpoint
+            docker exec morphy-frontend wget -q -O- http://localhost:3000 || echo "Warning: Container not responding yet"
+
